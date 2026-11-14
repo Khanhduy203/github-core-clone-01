@@ -598,6 +598,24 @@ export function encodePktLines(items: ReadonlyArray<string | Uint8Array | 'flush
   return Buffer.concat(parts);
 }
 
+/**
+ * Encode string-only pkt-lines into ONE Buffer: the length prefixes are computed from the byte
+ * lengths and the whole frame is a single Buffer.from. Same bytes as encodePktLines for string
+ * items, with one allocation instead of one per line plus a concat — the advertisements, ls-refs
+ * and report-status paths all serve small ASCII frames, so this is their hot path. Binary payloads
+ * (sideband packs) still go through encodePktLine.
+ */
+export function encodePktLinesFast(items: ReadonlyArray<string | 'flush' | 'delim' | 'response-end'>): Buffer {
+  const parts: string[] = [];
+  for (const item of items) {
+    if (item === 'flush') parts.push('0000');
+    else if (item === 'delim') parts.push('0001');
+    else if (item === 'response-end') parts.push('0002');
+    else parts.push((Buffer.byteLength(item, 'utf8') + 4).toString(16).padStart(4, '0'), item);
+  }
+  return Buffer.from(parts.join(''), 'utf8');
+}
+
 const HEX4 = /^[0-9a-fA-F]{4}$/;
 
 /**

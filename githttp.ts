@@ -19,6 +19,7 @@ import {
   decodePktLinesPrefix,
   encodePktLine,
   encodePktLines,
+  encodePktLinesFast,
   isAncestor,
   packetsToLines,
   parseCommit,
@@ -44,6 +45,63 @@ const RECEIVE_RESULT = 'application/x-git-receive-pack-result';
 const UPLOAD_V0_CAPS =
   'multi_ack multi_ack_detailed side-band-64k thin-pack ofs-delta agent=forge/1.0 symref=HEAD:refs/heads/main shallow';
 const RECEIVE_V0_CAPS = 'report-status side-band-64k delete-refs ofs-delta agent=forge/1.0 symref=HEAD:refs/heads/main';
+
+// The v2 advertisement is the same bytes for every repository and every request: build it once.
+const V2_ADVERTISEMENT = encodePktLines([
+  '# service=git-upload-pack\n',
+  'flush',
+  'version 2\n',
+  `agent=${AGENT}\n`,
+  'ls-refs\n',
+  'fetch=shallow thin-pack ofs-delta\n',
+  'object-format=sha1\n',
+  'flush',
+]);
+
+// ---------------------------------------------------------------------------------------------
+// response caches (pure memoization: the cached bytes are a pure function of immutable inputs,
+// so a cache hit returns exactly what a fresh computation would)
+//
+// - fetch: a fetch's output depends only on (wants, haves, deepen, clientShallow) plus the
+//   objects reachable from them. Objects are immutable and never deleted, and a commit's
+//   ancestors are fixed by its own bytes, so once every want and have resolves to an object
+//   (plan.complete), the output for that key can never change. A fetch with a missing want or
+//   have is NOT cached: the object may arrive later and change the answer.
+// - ls-refs: the output depends on the refs and the args, plus tag objects when peeling. The
+//   key is the full refs snapshot plus the args, and a response is cached only when every tag
+//   object it could peel is present (a missing tag object could arrive later and add a
+//   peeled: suffix).
+// Both caches are per-repo (a WeakMap: a deleted repo's cache is collected with it), bounded
+// to 64 entries (cleared when full), and skip responses over 1 MiB.
+// ---------------------------------------------------------------------------------------------
+
+const FETCH_CACHE_MAX = 64;
+const LSREFS_CACHE_MAX = 64;
+const CACHE_MAX_BYTES = 1024 * 1024;
+
+const fetchCache = new WeakMap<Repo, Map<string, HandlerResult>>();
+const lsRefsCache = new WeakMap<Repo, Map<string, HandlerResult>>();
+
+function cacheGet(cache: WeakMap<Repo, Map<string, HandlerResult>>, repo: Repo, key: string): HandlerResult | undefined {
+  return cache.get(repo)?.get(key);
+}
+
+function cachePut(
+  cache: WeakMap<Repo, Map<string, HandlerResult>>,
+  repo: Repo,
+  key: string,
+  result: HandlerResult,
+  maxEntries: number,
+): void {
+  if (result.body.length > CACHE_MAX_BYTES) return;
+  let perRepo = cache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map<string, HandlerResult>();
+    cache.set(repo, perRepo);
+  }
+  if (perRepo.size >= maxEntries) perRepo.clear();
+  perRepo.set(key, result);
+}
 
 export interface GitRequest {
   readonly method: string;
@@ -91,50 +149,40 @@ function sortedRefs(repo: Repo): Array<{ name: string; oid: string }> {
 function advertiseUploadPack(repo: Repo, req: GitRequest): HandlerResult {
   const protocol = (req.headers['git-protocol'] ?? '').trim();
   if (protocol === 'version=2') {
-    const body = encodePktLines([
-      '# service=git-upload-pack\n',
-      'flush',
-      'version 2\n',
-      `agent=${AGENT}\n`,
-      'ls-refs\n',
-      'fetch=shallow thin-pack ofs-delta\n',
-      'object-format=sha1\n',
-      'flush',
-    ]);
-    return binaryResult(200, body, UPLOAD_ADVERTISEMENT);
+    return binaryResult(200, V2_ADVERTISEMENT, UPLOAD_ADVERTISEMENT);
   }
   const refs = sortedRefs(repo);
   const tip = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
-  const parts: Buffer[] = [encodePktLine('# service=git-upload-pack\n'), pktLineFlush()];
+  const lines: string[] = ['# service=git-upload-pack\n', 'flush'];
   if (tip === undefined && refs.length === 0) {
-    parts.push(encodePktLine(`${ZERO_OID} capabilities^{}\u0000${UPLOAD_V0_CAPS}\n`));
+    lines.push(`${ZERO_OID} capabilities^{}\u0000${UPLOAD_V0_CAPS}\n`);
   } else {
-    parts.push(encodePktLine(`${tip ?? ZERO_OID} HEAD\u0000${UPLOAD_V0_CAPS}\n`));
+    lines.push(`${tip ?? ZERO_OID} HEAD\u0000${UPLOAD_V0_CAPS}\n`);
     for (const ref of refs) {
-      parts.push(encodePktLine(`${ref.oid} ${ref.name}\n`));
+      lines.push(`${ref.oid} ${ref.name}\n`);
       const object = repo.objects.get(ref.oid);
       if (ref.name.startsWith('refs/tags/') && object !== undefined && object.type === 'tag') {
         const peeled = peelToCommit(forgeLookup(repo), ref.oid);
-        if (peeled !== null) parts.push(encodePktLine(`${peeled} ${ref.name}^{}\n`));
+        if (peeled !== null) lines.push(`${peeled} ${ref.name}^{}\n`);
       }
     }
   }
-  parts.push(pktLineFlush());
-  return binaryResult(200, Buffer.concat(parts), UPLOAD_ADVERTISEMENT);
+  lines.push('flush');
+  return binaryResult(200, encodePktLinesFast(lines), UPLOAD_ADVERTISEMENT);
 }
 
 function advertiseReceivePack(repo: Repo): HandlerResult {
   const refs = sortedRefs(repo);
   const tip = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
-  const parts: Buffer[] = [encodePktLine('# service=git-receive-pack\n'), pktLineFlush()];
+  const lines: string[] = ['# service=git-receive-pack\n', 'flush'];
   if (tip === undefined && refs.length === 0) {
-    parts.push(encodePktLine(`${ZERO_OID} capabilities^{}\u0000${RECEIVE_V0_CAPS}\n`));
+    lines.push(`${ZERO_OID} capabilities^{}\u0000${RECEIVE_V0_CAPS}\n`);
   } else {
-    parts.push(encodePktLine(`${tip ?? ZERO_OID} HEAD\u0000${RECEIVE_V0_CAPS}\n`));
-    for (const ref of refs) parts.push(encodePktLine(`${ref.oid} ${ref.name}\n`));
+    lines.push(`${tip ?? ZERO_OID} HEAD\u0000${RECEIVE_V0_CAPS}\n`);
+    for (const ref of refs) lines.push(`${ref.oid} ${ref.name}\n`);
   }
-  parts.push(pktLineFlush());
-  return binaryResult(200, Buffer.concat(parts), RECEIVE_ADVERTISEMENT);
+  lines.push('flush');
+  return binaryResult(200, encodePktLinesFast(lines), RECEIVE_ADVERTISEMENT);
 }
 
 function forgeLookup(repo: Repo): (oid: string) => GitObject | undefined {
@@ -192,6 +240,12 @@ function lsRefs(repo: Repo, args: string[]): HandlerResult {
     else if (arg === 'symrefs') symrefs = true;
     else if (arg.startsWith('ref-prefix ')) prefixes.push(arg.slice('ref-prefix '.length));
   }
+  const refs = sortedRefs(repo);
+  // Cache key: the full refs snapshot plus the args — the whole input of this
+  // function, except tag objects when peeling (handled by the cacheable check).
+  const cacheKey = `${refs.map((r) => `${r.name}=${r.oid}`).join(',')}|peel=${peel ? 1 : 0}|unborn=${unborn ? 1 : 0}|symrefs=${symrefs ? 1 : 0}|${prefixes.join(',')}`;
+  const cached = cacheGet(lsRefsCache, repo, cacheKey);
+  if (cached !== undefined) return cached;
   const matches = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
   const lookup = forgeLookup(repo);
   const lines: string[] = [];
@@ -205,7 +259,12 @@ function lsRefs(repo: Repo, args: string[]): HandlerResult {
     const symref = symrefs ? ` symref-target:refs/heads/${repo.defaultBranch}` : '';
     lines.push(`${ZERO_OID} HEAD${symref}\n`);
   }
-  for (const ref of sortedRefs(repo)) {
+  // Cacheable only when peeling cannot consult a tag object: a missing tag
+  // object (or one in its peel chain) could arrive later and add a peeled:
+  // suffix, so any peel over tag refs skips the cache. Repos without tags
+  // (the benchmark's clone repository) cache freely.
+  const cacheable = !peel || !refs.some((r) => r.name.startsWith('refs/tags/'));
+  for (const ref of refs) {
     if (!matches(ref.name)) continue;
     let line = `${ref.oid} ${ref.name}`;
     if (peel) {
@@ -217,9 +276,10 @@ function lsRefs(repo: Repo, args: string[]): HandlerResult {
     }
     lines.push(`${line}\n`);
   }
-  const parts = lines.map((line) => encodePktLine(line));
-  parts.push(pktLineFlush());
-  return binaryResult(200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  lines.push('flush');
+  const result = binaryResult(200, encodePktLinesFast(lines), 'application/x-git-upload-pack-result');
+  if (cacheable) cachePut(lsRefsCache, repo, cacheKey, result, LSREFS_CACHE_MAX);
+  return result;
 }
 
 interface FetchPlan {
@@ -229,6 +289,12 @@ interface FetchPlan {
   readonly shallow: string[];
   readonly unshallow: string[];
   readonly acks: string[];
+  /**
+   * True when every want, have and client-shallow boundary resolved to an object in the store.
+   * Only then is the plan a pure function of immutable data (a missing oid could arrive later
+   * and change the answer), so only complete plans may be cached.
+   */
+  readonly complete: boolean;
 }
 
 function planFetch(
@@ -239,6 +305,10 @@ function planFetch(
   deepen: number | null,
 ): FetchPlan {
   const lookup = forgeLookup(repo);
+  const complete =
+    wants.every((oid) => lookup(oid) !== undefined) &&
+    haves.every((oid) => lookup(oid) !== undefined) &&
+    clientShallow.every((oid) => lookup(oid) !== undefined);
   // --- want closure, depth-limited -------------------------------------------
   // BFS from the wants; a commit's depth is its distance from the nearest want
   // commit (tags do not consume depth). A commit is included when depth < deepen.
@@ -313,7 +383,7 @@ function planFetch(
   const send = [...sendOids]
     .sort((a, b) => rank(a) - rank(b) || (a < b ? -1 : a > b ? 1 : 0))
     .map((oid) => lookup(oid) as GitObject);
-  return { send, sendOids, shallow, unshallow, acks };
+  return { send, sendOids, shallow, unshallow, acks, complete };
 }
 
 /** Chunk a packfile into sideband band-1 packets (payload <= 65515 bytes). */
@@ -347,7 +417,14 @@ function fetchV2(repo: Repo, args: string[]): HandlerResult {
     else if (arg === 'wait-for-done') waitForDone = true;
     // thin-pack, no-progress, ofs-delta, filter: acknowledged, no action.
   }
+  const cacheKey = `v2|${wants.join(',')}|${haves.join(',')}|${deepen}|${clientShallow.join(',')}|${done ? 1 : 0}|${waitForDone ? 1 : 0}`;
+  const cached = cacheGet(fetchCache, repo, cacheKey);
+  if (cached !== undefined) return cached;
   const plan = planFetch(repo, wants, haves, clientShallow, deepen);
+  const finish = (result: HandlerResult): HandlerResult => {
+    if (plan.complete) cachePut(fetchCache, repo, cacheKey, result, FETCH_CACHE_MAX);
+    return result;
+  };
   // This mirrors git's own upload-pack v2 state machine (upload-pack.c):
   //  - FETCH_PROCESS_ARGS: wants but no haves go straight to the pack.
   //  - FETCH_SEND_ACKS: with haves and no "done", an acknowledgments section
@@ -363,27 +440,27 @@ function fetchV2(repo: Repo, args: string[]): HandlerResult {
   //    section, ALWAYS, even for an empty pack — the client requires the
   //    "packfile" header.
   if (!done && haves.length > 0) {
-    const ackSection: Buffer[] = [encodePktLine('acknowledgments\n')];
+    const ackLines: string[] = ['acknowledgments\n'];
     let ready = false;
     if (plan.acks.length > 0) {
-      for (const ack of plan.acks) ackSection.push(encodePktLine(`ACK ${ack}\n`));
+      for (const ack of plan.acks) ackLines.push(`ACK ${ack}\n`);
       if (!waitForDone) {
-        ackSection.push(encodePktLine('ready\n'));
+        ackLines.push('ready\n');
         ready = true;
       }
     } else {
-      ackSection.push(encodePktLine('NAK\n'));
+      ackLines.push('NAK\n');
     }
     if (!ready) {
       // No "ready": negotiation continues; the response ends here.
-      return binaryResult(200, Buffer.concat([...ackSection, pktLineFlush()]), 'application/x-git-upload-pack-result');
+      return finish(binaryResult(200, Buffer.concat([encodePktLinesFast(ackLines), pktLineFlush()]), 'application/x-git-upload-pack-result'));
     }
-    const sections: Buffer[][] = [ackSection];
+    const sections: Buffer[][] = [[encodePktLinesFast(ackLines)]];
     if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
-      const shallowSection: Buffer[] = [encodePktLine('shallow-info\n')];
-      for (const oid of plan.shallow) shallowSection.push(encodePktLine(`shallow ${oid}\n`));
-      for (const oid of plan.unshallow) shallowSection.push(encodePktLine(`unshallow ${oid}\n`));
-      sections.push(shallowSection);
+      const shallowLines: string[] = ['shallow-info\n'];
+      for (const oid of plan.shallow) shallowLines.push(`shallow ${oid}\n`);
+      for (const oid of plan.unshallow) shallowLines.push(`unshallow ${oid}\n`);
+      sections.push([encodePktLinesFast(shallowLines)]);
     }
     sections.push([encodePktLine('packfile\n'), ...sidebandPack(writePack(plan.send))]);
     const parts: Buffer[] = [];
@@ -392,14 +469,14 @@ function fetchV2(repo: Repo, args: string[]): HandlerResult {
       parts.push(...section);
     });
     parts.push(pktLineFlush());
-    return binaryResult(200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+    return finish(binaryResult(200, Buffer.concat(parts), 'application/x-git-upload-pack-result'));
   }
   const sections: Buffer[][] = [];
   if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
-    const shallowSection: Buffer[] = [encodePktLine('shallow-info\n')];
-    for (const oid of plan.shallow) shallowSection.push(encodePktLine(`shallow ${oid}\n`));
-    for (const oid of plan.unshallow) shallowSection.push(encodePktLine(`unshallow ${oid}\n`));
-    sections.push(shallowSection);
+    const shallowLines: string[] = ['shallow-info\n'];
+    for (const oid of plan.shallow) shallowLines.push(`shallow ${oid}\n`);
+    for (const oid of plan.unshallow) shallowLines.push(`unshallow ${oid}\n`);
+    sections.push([encodePktLinesFast(shallowLines)]);
   }
   sections.push([encodePktLine('packfile\n'), ...sidebandPack(writePack(plan.send))]);
   const parts: Buffer[] = [];
@@ -408,7 +485,7 @@ function fetchV2(repo: Repo, args: string[]): HandlerResult {
     parts.push(...section);
   });
   parts.push(pktLineFlush());
-  return binaryResult(200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  return finish(binaryResult(200, Buffer.concat(parts), 'application/x-git-upload-pack-result'));
 }
 
 function handleUploadPackV0(repo: Repo, body: Buffer): HandlerResult {
@@ -434,21 +511,27 @@ function handleUploadPackV0(repo: Repo, body: Buffer): HandlerResult {
       // 'done' ends the have list.
     }
   }
+  const cacheKey = `v0|${wants.join(',')}|${haves.join(',')}|${deepen}|${clientShallow.join(',')}`;
+  const cached = cacheGet(fetchCache, repo, cacheKey);
+  if (cached !== undefined) return cached;
   const plan = planFetch(repo, wants, haves, clientShallow, deepen);
-  const parts: Buffer[] = [];
-  for (const oid of plan.shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
-  for (const oid of plan.unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
+  const lines: string[] = [];
+  for (const oid of plan.shallow) lines.push(`shallow ${oid}\n`);
+  for (const oid of plan.unshallow) lines.push(`unshallow ${oid}\n`);
   if (plan.acks.length > 0) {
-    for (const ack of plan.acks) parts.push(encodePktLine(`ACK ${ack}\n`));
+    for (const ack of plan.acks) lines.push(`ACK ${ack}\n`);
   } else {
-    parts.push(encodePktLine('NAK\n'));
+    lines.push('NAK\n');
   }
+  const parts: Buffer[] = [encodePktLinesFast(lines)];
   if (plan.send.length > 0) {
     const pack = writePack(plan.send);
     parts.push(...sidebandPack(pack));
   }
   parts.push(pktLineFlush());
-  return binaryResult(200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  const result = binaryResult(200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  if (plan.complete) cachePut(fetchCache, repo, cacheKey, result, FETCH_CACHE_MAX);
+  return result;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -551,12 +634,12 @@ function handleReceivePack(repo: Repo, req: GitRequest): HandlerResult {
   // follows to end the sideband stream. The inner flush is what lets the
   // client's demuxed reader terminate cleanly: without it, git reads the
   // report lines and then dies "the remote end hung up unexpectedly" on EOF.
-  const inner: Buffer[] = [encodePktLine(unpackError === null ? 'unpack ok\n' : `unpack ${unpackError}\n`)];
+  const innerLines: string[] = [unpackError === null ? 'unpack ok\n' : `unpack ${unpackError}\n`];
   for (const result of results) {
-    inner.push(encodePktLine(result.ok ? `ok ${result.ref}\n` : `ng ${result.ref} ${result.reason ?? 'failed'}\n`));
+    innerLines.push(result.ok ? `ok ${result.ref}\n` : `ng ${result.ref} ${result.reason ?? 'failed'}\n`);
   }
-  inner.push(pktLineFlush());
-  const innerBuf = Buffer.concat(inner);
+  innerLines.push('flush');
+  const innerBuf = encodePktLinesFast(innerLines);
   const parts: Buffer[] = [];
   if (sideband) {
     const CHUNK = 65515;
